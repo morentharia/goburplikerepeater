@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,8 +31,8 @@ func init() {
 }
 
 const (
-	RWTimeout   = time.Second * 2
-	DealTimeout = time.Second * 10
+	RWTimeout   = time.Second * 20
+	DealTimeout = time.Second * 30
 	CRLF        = "\r\n"
 	SemSize     = 20
 )
@@ -38,9 +40,10 @@ const (
 type Options struct {
 	// Example of verbosity with level
 	// Verbose   []bool `short:"v" long:"verbose" description:"Verbose output"`
-	Target     string `short:"t" long:"target" description:"Example: ya.ru" required:"true"`
-	HTTPProxy  string `short:"x" long:"proxy" description:"Example: loalhost:8080" default:""`
-	JSONOutput bool   `long:"json" description:"json output" `
+	Target      string `short:"t" long:"target" description:"Example: https://ya.ru" required:"false"`
+	HTTPProxy   string `short:"x" long:"proxy" description:"Example: loalhost:8080" default:""`
+	JSONOutput  bool   `long:"json" description:"json output" `
+	NotUpdateCL bool   `long:"not-update-cl" description:"do not update Content-Length header" `
 }
 
 var options Options
@@ -70,6 +73,24 @@ func dialProxy(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
+func UnescapeCRLF(content string) (string, error) {
+	log.Printf("content = %#v\n", content)
+
+	r := bufio.NewReader(strings.NewReader(content))
+	st, err := r.ReadString('\n')
+	if err != nil {
+		return "", errors.Wrap(err, "")
+	}
+
+	if strings.Contains(st, "\\r\\n") {
+		content = strings.ReplaceAll(content, "\r", "")
+		content = strings.ReplaceAll(content, "\n", "")
+		content = strings.ReplaceAll(content, "\\r", "\r")
+		content = strings.ReplaceAll(content, "\\n", "\n")
+	}
+
+	return content, nil
+}
 func UpdateContentLength(content string) (string, error) {
 	var (
 		res           strings.Builder
@@ -79,12 +100,13 @@ func UpdateContentLength(content string) (string, error) {
 	_ = body
 	r := bufio.NewReader(strings.NewReader(content))
 	st, err := r.ReadString('\n')
-	// fmt.Printf("st = %#v\n", st)
+	log.Printf("st = %#v\n", st)
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
 	for {
 		h, err := r.ReadString('\n')
+		log.Printf("h = %#v\n", h)
 		if err != nil || h == CRLF {
 			break
 		}
@@ -97,7 +119,7 @@ func UpdateContentLength(content string) (string, error) {
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
-	// log.Printf("st = %#v    \n", st)
+	log.Printf("st = %#v    \n", st)
 	res.WriteString(st)
 
 	for {
@@ -139,17 +161,28 @@ func SendRawRequest(content string) (string, string, error) {
 	case "https":
 		useTLS, port = true, 443
 	default:
-		return "", "", errors.Wrapf(err, "wrong target format %v Example: https:ya.ru:420", options.Target)
+		return "", "", errors.Wrapf(errors.New(""), "wrong target format %v Example: https://ya.ru:420", options.Target)
 	}
+
 	target := u.Host
 	hostport := strings.Split(u.Host, ":")
 	if len(hostport) == 2 {
 		target = hostport[0]
 		port, _ = strconv.Atoi(hostport[1])
 	}
-	content, err = UpdateContentLength(content)
+	log.Printf("%s\n", content)
+	content, err = UnescapeCRLF(content)
 	if err != nil {
-		return "", "", errors.Wrap(err, "")
+		return "", "", errors.Wrap(err, "unescape CRLF error")
+	}
+	// log.Printf("%s\n", content)
+
+	if !options.NotUpdateCL {
+		content, err = UpdateContentLength(content)
+		log.Printf("after :%s\n", content)
+		if err != nil {
+			return "", "", errors.Wrap(err, "")
+		}
 	}
 	var conn net.Conn
 
@@ -215,6 +248,11 @@ func main() {
 		func(filename string) {
 			g.Go(func() error {
 				<-sem
+				usr, _ := user.Current()
+				dir := usr.HomeDir
+				if strings.HasPrefix(filename, "~/") {
+					filename = filepath.Join(dir, filename[2:])
+				}
 				var file io.ReadCloser
 				if filename == "-" {
 					file = os.Stdin
@@ -230,6 +268,8 @@ func main() {
 				if err != nil {
 					return errors.Wrap(err, "")
 				}
+				log.Printf("%s\n", string(b))
+
 				request, response, err := SendRawRequest(string(b))
 				if err != nil {
 					return errors.Wrap(err, "")
